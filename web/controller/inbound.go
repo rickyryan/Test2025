@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"strconv"
+	"x-ui/database"
 	"x-ui/database/model"
 	"x-ui/logger"
 	"x-ui/web/global"
@@ -54,10 +56,8 @@ func (a *InboundController) getInbounds(c *gin.Context) {
 	)
 
 	if session.IsAdmin(user) {
-		// 管理员：获取全部入站
 		inbounds, err = a.inboundService.GetAllInbounds()
 	} else {
-		// 普通用户：仅获取自己的入站
 		inbounds, err = a.inboundService.GetInbounds(user.Id)
 	}
 
@@ -69,55 +69,54 @@ func (a *InboundController) getInbounds(c *gin.Context) {
 	jsonObj(c, inbounds, nil)
 }
 
-
 func (a *InboundController) addInbound(c *gin.Context) {
 	user := session.GetLoginUser(c)
 	if user.Role != "admin" {
 		jsonMsg(c, "权限不足，仅管理员可添加入站", errors.New("forbidden"))
 		return
 	}
+
 	inbound := &model.Inbound{}
 	err := c.ShouldBind(inbound)
 	if err != nil {
-		jsonMsg(c, "添加", err)
+		jsonMsg(c, "参数绑定失败", err)
 		return
 	}
 
-	// 获取当前操作用户（一般为管理员）
-	currentUser := session.GetLoginUser(c)
-	inbound.UserId = currentUser.Id
 	inbound.Enable = true
 	inbound.Tag = fmt.Sprintf("inbound-%v", inbound.Port)
 
-	// 添加入站信息
-	err = a.inboundService.AddInbound(inbound)
-	if err == nil {
-		a.xrayService.SetToNeedRestart()
+	db := database.GetDB()
+	userService := service.UserService{}
 
-		// 🔽 自动创建新用户：用户名为入站备注，密码为 admin
-		userService := service.UserService{}
-		db := database.GetDB()
+	// 🔍 检查是否已存在同名用户
+	var count int64
+	db.Model(&model.User{}).Where("username = ?", inbound.Remark).Count(&count)
 
-		// 检查是否已存在该用户名
-		existing := userService.CheckUser(inbound.Remark, "admin")
-		if existing == nil {
-			newUser := &model.User{
-				Username: inbound.Remark,
-				Password: "admin", // 明文存储，不安全（建议改为加密）
-				Role:     "viewer", // 默认入站自动创建的用户为只读角色
-			}
-			errUser := db.Create(newUser).Error
-			if errUser == nil {
-				// ✅ 将新建入站的 UserId 设置为新用户 ID
-				inbound.UserId = newUser.Id
-				_ = db.Save(inbound).Error
-			}
+	if count == 0 {
+		// ✅ 创建 viewer 用户
+		newUser := &model.User{
+			Username: inbound.Remark,
+			Password: "admin",
+			Role:     "viewer",
 		}
+		err = db.Create(newUser).Error
+		if err == nil {
+			inbound.UserId = newUser.Id
+		}
+	} else {
+		// ❗ 用户已存在，则不创建，默认绑定当前操作用户（admin）
+		inbound.UserId = user.Id
 	}
 
-	jsonMsg(c, "添加", err)
-}
+	// ✅ 添加入站
+	err = a.inboundService.AddInbound(inbound)
+	jsonMsg(c, "添加入站", err)
 
+	if err == nil {
+		a.xrayService.SetToNeedRestart()
+	}
+}
 
 func (a *InboundController) delInbound(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
